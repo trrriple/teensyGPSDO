@@ -2,6 +2,7 @@
 #include <SparkFun_u-blox_GNSS_Arduino_Library.h> //http://librarymanager/All#SparkFun_u-blox_GNSS
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <math.h>
 
 
 #include "extIntFreqCount.h"
@@ -16,28 +17,29 @@
 DAC8550 dac(10);
 
 
-
+#define GOAL_FREQ 10000000.0
 #define PPS_PIN 7
 #define GpsSerial Serial1
 #define DAC_VREF 5.0
 #define DAC_COUNTS 65536
 #define DAC_ZERO_VAL (DAC_VREF / 2)
 
-#define ROLLING_TIME 10
 
 static const float K_DAC_LSB = DAC_VREF / DAC_COUNTS;
 
-static uint32_t freqCountTenBuf[ROLLING_TIME];
-static uint32_t freqCountHunBuf[ROLLING_TIME];
-static uint32_t freqCountThouBuf[ROLLING_TIME];
+static uint32_t freqTenBuf[10];
+static uint32_t freqHunBuf[100];
+static uint32_t freqThouBuf[1000];
 
-static uint8_t  curRollTenPos = 0;
-static uint8_t  curRollHunBuf = 0;
-static uint8_t  curRollThouBuf = 0;
+static uint8_t curRollTenPos  = 0;
+static uint8_t curRollHunBuf  = 0;
+static uint8_t curRollThouBuf = 0;
 
-static bool curRollTenBufFull = 0;
-static bool curRollTenHunFull = 0;
-static bool curRollTenThouFull = 0;
+static bool freqTenBufFull  = 0;
+static bool freqTenHunFull  = 0;
+static bool freqTenThouFull = 0;
+
+static double freqTenBufAvg = 0.0;
 
 
 LiquidCrystal_I2C lcd(0x27,20,4);  // set the LCD address to 0x27 for a 16 chars and 2 line display
@@ -94,25 +96,124 @@ void setup()
 
 }
 
+static void _updateLCD()
+{
+    lcd.clear();
+    lcd.print("f(10): ");
+    lcd.print(freqTenBufAvg, 4);
+    Serial.println(freqTenBufAvg, 4);
+
+    uint32_t tow_ms = gps.getTimeOfWeek();
+    float tow_s = (float)tow_ms / 1000.0;
+    lcd.setCursor(0, 1);
+    lcd.print(F("TOW: "));
+    lcd.print(tow_s);
+
+    Serial.print(F("TOW: "));
+    Serial.print(tow_s);
+
+    byte siv = gps.getSIV();
+    lcd.setCursor(0, 2);
+    lcd.print(F("SIV: "));
+    lcd.print(siv);
+
+    Serial.print(F(" SIV: "));
+    Serial.print(siv);
+
+    Serial.println();
+}
+
+static void _calcAvgs()
+{
+    if(freqTenBufFull)
+    {   
+        freqTenBufAvg = 0;
+        for(int i = 0; i < 10; i++)
+        {
+            freqTenBufAvg += freqTenBuf[i];
+        }
+        freqTenBufAvg /= 10.0;
+    }
+}
+
+
+static void _tuneOsc()
+{
+    static float targetVoltage = 2.0; /* Middle of OXCO 4.0 V tuning range */
+    /* Manipulate the DAC to hone in on correct frequency */
+
+    double curError = GOAL_FREQ - freqTenBufAvg;
+
+
+    float adjVal = 0;
+    /* precision steering */
+    if(abs(curError) < .2)
+    {
+        adjVal = .001;
+    }
+    /* fine steering */
+    else if(abs(curError) < 1)
+    {
+        adjVal = .01;
+    }
+    /* coarse steering */
+    else
+    {
+        adjVal = .1;
+    }
+
+    /* increase case */
+    if(curError > 0)
+    { 
+        targetVoltage += adjVal;
+        Serial.print("DAC target voltage: ");
+        Serial.print(targetVoltage, 5);
+        Serial.print(" (");
+        Serial.print(adjVal, 5);
+        Serial.println(")");
+    }
+    /* decrease case */
+    else
+    {
+        targetVoltage -= adjVal;
+        Serial.print("DAC target voltage: ");
+        Serial.print(targetVoltage, 5);
+        Serial.print(" (");
+        Serial.print(-adjVal, 5);
+        Serial.println(")");
+    }
+
+    int targetVoltageRaw = _getDacVal(targetVoltage);
+    dac.setValue(targetVoltageRaw);
+}
 
 /* The PPS will set a flag which latches the current frequncy count, we 
    essentially loop on this value and check the count when it is valid */
-static void ppsHandler()
+static void _ppsHandler()
 {
     if(ExtIntFreqCount.available())
     {
         uint32_t count = ExtIntFreqCount.read();
 
-        freqCountBuf[curRollPos] = count;
+        freqTenBuf[curRollTenPos] = count;
 
-        if(curRollPos < ROLLING_TIME)
+        if(curRollTenPos < 10)
         {
-            curRollPos++;
+            curRollTenPos++;
         }
         else
         {
-            curRollPos = 0;
+            freqTenBufFull = true; /* After the first 10, always true */
+            curRollTenPos = 0;
+            _tuneOsc();           
+        }
 
+
+        /* Update LCD */
+        if(freqTenBufFull)
+        {
+            _calcAvgs();
+            _updateLCD();
         }
     }
 
@@ -120,39 +221,5 @@ static void ppsHandler()
 
 void loop()
 {
-
-    static float goalVoltage = 0;
-    if ()
-    {
-        unsigned long count = ExtIntFreqCount.read();
-
-        lcd.clear();
-        lcd.print("Count: ");
-        lcd.print(count);
-        Serial.println(count);
-        
-        uint32_t tow_ms = gps.getTimeOfWeek();
-        float    tow_s   = (float)tow_ms / 1000.0;
-        lcd.setCursor(0, 1);
-        lcd.print(F("TOW: "));
-        lcd.print(tow_s);
-        
-        Serial.print(F("TOW: "));
-        Serial.print(tow_s);
-        
-        byte siv = gps.getSIV();
-        lcd.setCursor(0, 2);
-        lcd.print(F("SIV: "));
-        lcd.print(siv);
-
-        Serial.print(F(" SIV: "));
-        Serial.print(siv);
-
-        Serial.println();
-        goalVoltage = 2.0;
-        int goalVoltageRaw = _getDacVal(goalVoltage);
-        dac.setValue(goalVoltageRaw);
-    }
-
-    // dac.setChipChanValue(1, 0, goalVoltageRaw);
+    _ppsHandler();
 }
